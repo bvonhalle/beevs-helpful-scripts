@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_REF="origin/main"
+DELETE_MERGED=false
+DRY_RUN=true
+FETCH=true
+USE_GITHUB=true
+REPO=""
+STALE_DAYS=90
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+KEEP_FILE="$CONFIG_HOME/clean-github-branches/keep"
+PROTECTED_BRANCHES="main,master,test,prod,develop"
+
+usage() {
+  cat <<'USAGE'
+Usage: clean-github-branches [options]
+
+Reports stale local branches and optionally deletes local branches that are
+confirmed merged either by Git ancestry or by a matching merged GitHub PR.
+
+Options:
+  --delete-merged       Delete branches confirmed merged. Without this, dry-run only.
+  --dry-run             Report what would happen without deleting. Default.
+  --report-stale        Report stale candidates. Default behavior.
+  --base REF            Base ref for ancestry checks. Default: origin/main.
+  --repo OWNER/REPO     GitHub repo for PR lookup. Default: inferred from origin.
+  --stale-days DAYS     Age threshold for no-PR stale candidates. Default: 90.
+  --keep-file FILE      Branches to suppress from stale reports.
+  --protect BRANCH      Additional branch name to protect. Can be repeated.
+  --no-github           Skip GitHub PR-state checks.
+  --skip-fetch          Do not run git fetch --prune before checking.
+  -h, --help            Show this help.
+
+Examples:
+  clean-github-branches
+  clean-github-branches --delete-merged
+  clean-github-branches --base origin/main --stale-days 60
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --delete-merged)
+      DELETE_MERGED=true
+      DRY_RUN=false
+      ;;
+    --dry-run | --report-stale)
+      DRY_RUN=true
+      ;;
+    --base)
+      BASE_REF="${2:-}"
+      shift
+      ;;
+    --repo)
+      REPO="${2:-}"
+      shift
+      ;;
+    --stale-days)
+      STALE_DAYS="${2:-}"
+      shift
+      ;;
+    --keep-file)
+      KEEP_FILE="${2:-}"
+      shift
+      ;;
+    --protect)
+      PROTECTED_BRANCHES="${PROTECTED_BRANCHES},${2:-}"
+      shift
+      ;;
+    --no-github)
+      USE_GITHUB=false
+      ;;
+    --skip-fetch)
+      FETCH=false
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if ! [[ "$STALE_DAYS" =~ ^[0-9]+$ ]]; then
+  echo "--stale-days must be a positive integer" >&2
+  exit 2
+fi
+
+git rev-parse --show-toplevel >/dev/null
+
+if [[ "$FETCH" == true ]]; then
+  git fetch --prune origin
+fi
+
+if [[ "$USE_GITHUB" == true && -z "$REPO" ]]; then
+  origin_url="$(git remote get-url origin 2>/dev/null || true)"
+  REPO="$(
+    printf '%s\n' "$origin_url" |
+      sed -E 's#^git@github.com:##; s#^https://github.com/##; s#\.git$##'
+  )"
+fi
+
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/clean-github-branches.XXXXXX")"
+trap 'rm -rf "$tmp_dir"' EXIT
+
+branches_file="$tmp_dir/branches.tsv"
+keep_file="$tmp_dir/keep.txt"
+prs_file="$tmp_dir/prs.tsv"
+worktrees_file="$tmp_dir/worktrees.txt"
+git_merged_file="$tmp_dir/git-merged.txt"
+github_merged_file="$tmp_dir/github-merged.txt"
+stale_file="$tmp_dir/stale.tsv"
+active_file="$tmp_dir/active.tsv"
+skipped_file="$tmp_dir/skipped.tsv"
+git_delete_file="$tmp_dir/git-merged.delete.txt"
+
+current_branch="$(git branch --show-current)"
+
+if [[ -f "$KEEP_FILE" ]]; then
+  awk '{ sub(/[[:space:]]*#.*/, ""); sub(/[[:space:]]+$/, ""); if ($0 != "") print }' "$KEEP_FILE" >"$keep_file"
+else
+  : >"$keep_file"
+fi
+
+: >"$prs_file"
+: >"$git_delete_file"
+: >"$github_merged_file"
+: >"$stale_file"
+: >"$active_file"
+: >"$skipped_file"
+
+git worktree list --porcelain |
+  awk '/^branch refs\/heads\// { sub(/^branch refs\/heads\//, "", $0); print }' \
+    >"$worktrees_file"
+
+git for-each-ref refs/heads \
+  --format='%(refname:short)%09%(committerdate:unix)%09%(committerdate:short)%09%(upstream:short)%09%(upstream:track)%09%(subject)' \
+  >"$branches_file"
+
+if git rev-parse --verify --quiet "$BASE_REF" >/dev/null; then
+  git branch --merged "$BASE_REF" --format='%(refname:short)' >"$git_merged_file"
+else
+  : >"$git_merged_file"
+  echo "Warning: base ref '$BASE_REF' was not found; skipping Git ancestry merge checks." >&2
+fi
+
+if [[ "$USE_GITHUB" == true ]]; then
+  if [[ "$REPO" == */* ]] && command -v gh >/dev/null; then
+    if ! gh pr list \
+      --repo "$REPO" \
+      --state all \
+      --limit 2000 \
+      --json number,headRefName,state,mergedAt,title,updatedAt,url \
+      --jq '.[] | [.headRefName,.state,.number,.mergedAt,.updatedAt,.title,.url] | @tsv' \
+      >"$prs_file"; then
+      : >"$prs_file"
+      echo "Warning: GitHub PR-state checks failed; continuing with local Git checks only." >&2
+    fi
+  else
+    echo "Warning: GitHub PR-state checks unavailable. Install/authenticate gh or pass --repo OWNER/REPO." >&2
+  fi
+fi
+
+awk -F '\t' -v OFS='\t' \
+  -v now="$(date +%s)" \
+  -v stale_days="$STALE_DAYS" \
+  -v current="$current_branch" \
+  -v protected_csv="$PROTECTED_BRANCHES" \
+  -v git_delete_file="$git_delete_file" \
+  -v github_delete_file="$github_merged_file" \
+  -v stale_file="$stale_file" \
+  -v active_file="$active_file" \
+  -v skipped_file="$skipped_file" \
+  '
+  BEGIN {
+    split(protected_csv, protected_parts, ",")
+    for (i in protected_parts) {
+      protected[protected_parts[i]] = 1
+    }
+  }
+  FILENAME == ARGV[1] {
+    keep[$1] = 1
+    next
+  }
+  FILENAME == ARGV[2] {
+    worktree[$1] = 1
+    next
+  }
+  FILENAME == ARGV[3] {
+    git_merged[$1] = 1
+    next
+  }
+  FILENAME == ARGV[4] {
+    priority = ($2 == "OPEN") ? 3 : (($2 == "MERGED") ? 2 : 1)
+    if (priority > pr_priority[$1]) {
+      pr_priority[$1] = priority
+      pr_state[$1] = $2
+      pr_number[$1] = $3
+      pr_title[$1] = $6
+    }
+    next
+  }
+  FILENAME == ARGV[5] {
+    branch = $1
+    commit_unix = $2
+    commit_date = $3
+    upstream = $4
+    track = $5
+    subject = $6
+
+    if (branch in protected) {
+      print branch, "protected", commit_date, upstream, track, subject > skipped_file
+      next
+    }
+    if (branch == current) {
+      print branch, "current branch", commit_date, upstream, track, subject > skipped_file
+      next
+    }
+    if (branch in worktree) {
+      print branch, "checked out in a worktree", commit_date, upstream, track, subject > skipped_file
+      next
+    }
+
+    pr = (branch in pr_state) ? pr_state[branch] : "NO_PR_FOUND"
+    age_days = int((now - commit_unix) / 86400)
+
+    if (branch in git_merged) {
+      print branch > git_delete_file
+      next
+    }
+    if (pr == "MERGED") {
+      print branch > github_delete_file
+      next
+    }
+
+    if (branch in keep) {
+      print branch, "marked keep", commit_date, age_days, upstream, track, subject > active_file
+      next
+    }
+
+    if (pr == "OPEN") {
+      print branch, "open PR #" pr_number[branch], commit_date, age_days, upstream, track, pr_title[branch] > active_file
+      next
+    }
+
+    reason = ""
+    if (pr == "CLOSED") {
+      reason = "closed PR #" pr_number[branch] " not merged"
+    } else if (track == "[gone]") {
+      reason = "upstream gone"
+    } else if (pr == "NO_PR_FOUND" && age_days >= stale_days) {
+      reason = "no PR found and older than " stale_days " days"
+    } else if (track ~ /ahead|behind/) {
+      reason = "diverged from upstream"
+    }
+
+    if (reason != "") {
+      print branch, reason, commit_date, age_days, upstream, track, subject > stale_file
+    } else {
+      print branch, "recent/no clear stale signal", commit_date, age_days, upstream, track, subject > active_file
+    }
+  }
+  ' \
+  "$keep_file" "$worktrees_file" "$git_merged_file" "$prs_file" "$branches_file"
+
+sort -u "$git_delete_file" >"$git_merged_file"
+sort -u "$github_merged_file" -o "$github_merged_file"
+
+print_section() {
+  local title="$1"
+  local file="$2"
+
+  echo
+  echo "$title"
+  echo "${title//?/-}"
+  if [[ -s "$file" ]]; then
+    cat "$file"
+  else
+    echo "(none)"
+  fi
+}
+
+print_section "Git ancestry merged local branches" "$git_merged_file"
+print_section "GitHub PR merged local branches" "$github_merged_file"
+print_section "Manual stale candidates" "$stale_file"
+print_section "Left alone as active/recent" "$active_file"
+print_section "Protected/skipped" "$skipped_file"
+
+if [[ "$DELETE_MERGED" == true ]]; then
+  echo
+  echo "Deleting confirmed merged branches..."
+  if [[ -s "$git_merged_file" ]]; then
+    xargs git branch -d <"$git_merged_file"
+  fi
+  if [[ -s "$github_merged_file" ]]; then
+    xargs git branch -D <"$github_merged_file"
+  fi
+elif [[ "$DRY_RUN" == true ]]; then
+  echo
+  echo "Dry run only. Re-run with --delete-merged to delete confirmed merged branches."
+fi
