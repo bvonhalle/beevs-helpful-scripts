@@ -6,8 +6,8 @@ Small scripts for everyday developer housekeeping.
 
 ### `git/clean-github-branches`
 
-Reports stale local Git branches and optionally deletes local branches that are
-confirmed merged.
+Reports stale local Git branches and optionally deletes local branches, plus
+their matching `origin` branches, when confirmed merged.
 
 It catches two common cases:
 
@@ -15,8 +15,8 @@ It catches two common cases:
 - branches whose matching GitHub pull request is `MERGED`, including squash or
   rebase merge workflows that plain `git branch --merged` can miss
 
-It only deletes **local branches**. It does not delete remote branches or GitHub
-pull requests.
+It deletes **local branches** and their matching `origin/<branch>` remote refs
+when the branch is confirmed merged. It does not delete GitHub pull requests.
 
 ## Install
 
@@ -46,8 +46,9 @@ clean-github-branches --delete-merged
 clean-github-branches --base origin/main --stale-days 60
 ```
 
-The default run is a dry run. Use `--delete-merged` to delete only branches that
-are confirmed merged by Git ancestry or GitHub PR state.
+The default run is a dry run. Use `--delete-merged` to delete only local
+branches that are confirmed merged by Git ancestry or GitHub PR state, along
+with matching `origin/<branch>` refs when present.
 
 ## Keep List
 
@@ -87,5 +88,5 @@ The script protects:
 - protected branch names such as `main`, `master`, `test`, `prod`, and `develop`
 - anything not confirmed merged unless you manually inspect it
 
-Run the dry-run output first. Local branch cleanup is useful, but it deserves a
-tiny speed bump.
+Run the dry-run output first. Branch cleanup is useful, but deleting remote refs
+deserves a tiny speed bump.

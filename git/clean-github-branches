@@ -16,8 +16,9 @@ usage() {
   cat <<'USAGE'
 Usage: clean-github-branches [options]
 
-Reports stale local branches and optionally deletes local branches that are
-confirmed merged either by Git ancestry or by a matching merged GitHub PR.
+Reports stale local branches and optionally deletes local branches, plus their
+matching origin branches, when confirmed merged either by Git ancestry or by a
+matching merged GitHub PR.
 
 Options:
   --delete-merged       Delete branches confirmed merged. Without this, dry-run only.
@@ -115,10 +116,12 @@ prs_file="$tmp_dir/prs.tsv"
 worktrees_file="$tmp_dir/worktrees.txt"
 git_merged_file="$tmp_dir/git-merged.txt"
 github_merged_file="$tmp_dir/github-merged.txt"
+github_delete_file="$tmp_dir/github-merged.delete.txt"
 stale_file="$tmp_dir/stale.tsv"
 active_file="$tmp_dir/active.tsv"
 skipped_file="$tmp_dir/skipped.tsv"
 git_delete_file="$tmp_dir/git-merged.delete.txt"
+remote_delete_file="$tmp_dir/remote-merged.delete.txt"
 
 current_branch="$(git branch --show-current)"
 
@@ -131,6 +134,8 @@ fi
 : >"$prs_file"
 : >"$git_delete_file"
 : >"$github_merged_file"
+: >"$github_delete_file"
+: >"$remote_delete_file"
 : >"$stale_file"
 : >"$active_file"
 : >"$skipped_file"
@@ -271,6 +276,15 @@ awk -F '\t' -v OFS='\t' \
 
 sort -u "$git_delete_file" >"$git_merged_file"
 sort -u "$github_merged_file" -o "$github_merged_file"
+awk 'FNR == NR { git_merged[$0] = 1; next } !($0 in git_merged)' \
+  "$git_merged_file" "$github_merged_file" \
+  >"$github_delete_file"
+
+while IFS= read -r branch; do
+  if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    printf '%s\n' "$branch"
+  fi
+done < <(cat "$git_merged_file" "$github_merged_file" | sort -u) >"$remote_delete_file"
 
 print_section() {
   local title="$1"
@@ -288,6 +302,7 @@ print_section() {
 
 print_section "Git ancestry merged local branches" "$git_merged_file"
 print_section "GitHub PR merged local branches" "$github_merged_file"
+print_section "Matching origin branches to delete" "$remote_delete_file"
 print_section "Manual stale candidates" "$stale_file"
 print_section "Left alone as active/recent" "$active_file"
 print_section "Protected/skipped" "$skipped_file"
@@ -298,10 +313,15 @@ if [[ "$DELETE_MERGED" == true ]]; then
   if [[ -s "$git_merged_file" ]]; then
     xargs git branch -d <"$git_merged_file"
   fi
-  if [[ -s "$github_merged_file" ]]; then
-    xargs git branch -D <"$github_merged_file"
+  if [[ -s "$github_delete_file" ]]; then
+    xargs git branch -D <"$github_delete_file"
+  fi
+  if [[ -s "$remote_delete_file" ]]; then
+    echo
+    echo "Deleting matching origin branches..."
+    xargs git push origin --delete <"$remote_delete_file"
   fi
 elif [[ "$DRY_RUN" == true ]]; then
   echo
-  echo "Dry run only. Re-run with --delete-merged to delete confirmed merged branches."
+  echo "Dry run only. Re-run with --delete-merged to delete confirmed merged local and matching origin branches."
 fi
